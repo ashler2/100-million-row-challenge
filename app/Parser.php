@@ -58,7 +58,6 @@ final class Parser
         $pathIds = [];
         $paths = [];
         $pathCount = 0;
-        $warmUpCounts = [];
 
         if ($lastNl !== false) {
             $pos = 0;
@@ -66,49 +65,16 @@ final class Parser
                 $nlPos = strpos($chunk, "\n", $pos + 55);
 
                 $path = substr($chunk, $pos + 25, $nlPos - $pos - 51);
-                $pathId = $pathIds[$path] ?? -1;
-
-                if ($pathId === -1) {
-                    $pathId = $pathCount;
-                    $pathIds[$path] = $pathId;
+                if (!isset($pathIds[$path])) {
+                    $pathIds[$path] = $pathCount;
                     $paths[$pathCount] = $path;
                     $pathCount++;
                 }
 
-                $dateId = $dateIds[substr($chunk, $nlPos - 23, 8)];
-                $warmUpCounts[$pathId][$dateId] = ($warmUpCounts[$pathId][$dateId] ?? 0) + 1;
                 $pos = $nlPos + 1;
             }
         }
         unset($chunk);
-
-        $warmUpEnd = $lastNl !== false ? $lastNl + 1 : 0;
-        for ($i = 0; $i < $workers; $i++) {
-            if ($boundaries[$i] < $warmUpEnd) {
-                $boundaries[$i] = $warmUpEnd;
-            }
-        }
-
-        $warmUpFlat = array_fill(0, $pathCount * $dateCount, 0);
-        foreach ($warmUpCounts as $pId => $dateCounts) {
-            $base = $pId * $dateCount;
-            foreach ($dateCounts as $dId => $count) {
-                $warmUpFlat[$base + $dId] = $count;
-            }
-        }
-        unset($warmUpCounts);
-
-        $quickPath = [];
-        foreach ($paths as $id => $p) {
-            $pLen = strlen($p);
-            $fc = $p[0];
-            $lc = $p[$pLen - 1];
-            if (!isset($quickPath[$pLen][$fc][$lc])) {
-                $quickPath[$pLen][$fc][$lc] = $id;
-            } else {
-                $quickPath[$pLen][$fc][$lc] = -1;
-            }
-        }
 
         $total = $pathCount * $dateCount;
         $shmSize = $total * 4;
@@ -124,7 +90,7 @@ final class Parser
             if ($pid === 0) {
                 $data = self::processChunk(
                     $inputPath, $boundaries[$i], $boundaries[$i + 1],
-                    $pathIds, $dateIds, $pathCount, $dateCount, $quickPath,
+                    $pathIds, $dateIds, $pathCount, $dateCount,
                 );
                 shmop_write($shmId, pack('V*', ...$data), 0);
                 exit(0);
@@ -135,19 +101,14 @@ final class Parser
 
         $parentCounts = self::processChunk(
             $inputPath, $boundaries[$workers - 1], $boundaries[$workers],
-            $pathIds, $dateIds, $pathCount, $dateCount, $quickPath,
+            $pathIds, $dateIds, $pathCount, $dateCount,
         );
 
         foreach ($pids as $pid) {
             pcntl_waitpid($pid, $status);
         }
 
-        $mergedCounts = $warmUpFlat;
-        unset($warmUpFlat);
-
-        for ($j = 0; $j < $total; $j++) {
-            $mergedCounts[$j] += $parentCounts[$j];
-        }
+        $mergedCounts = $parentCounts;
         unset($parentCounts);
 
         foreach ($shmIds as [$shmKey, $shmId]) {
@@ -198,7 +159,6 @@ final class Parser
         array $dateIds,
         int $pathCount,
         int $dateCount,
-        array $quickPath,
     ): array {
         $stride = $dateCount;
         $counts = array_fill(0, $pathCount * $stride, 0);
@@ -214,7 +174,8 @@ final class Parser
         $remaining = $end - $start;
 
         while ($remaining > 0) {
-            $chunk = fread($handle, $remaining > 33_554_432 ? 33_554_432 : $remaining);
+            $readSize = $remaining > 33_554_432 ? 33_554_432 : $remaining;
+            $chunk = fread($handle, $readSize);
             $chunkLen = strlen($chunk);
             $remaining -= $chunkLen;
 
@@ -232,11 +193,7 @@ final class Parser
             while ($pos < $lastNl) {
                 $nlPos = strpos($chunk, "\n", $pos + 55);
 
-                $pathId = $quickPath[$nlPos - $pos - 51][$chunk[$pos + 25]][$chunk[$nlPos - 27]] ?? -1;
-
-                if ($pathId < 0) {
-                    $pathId = $pathIds[substr($chunk, $pos + 25, $nlPos - $pos - 51)] ?? -1;
-                }
+                $pathId = $pathIds[substr($chunk, $pos + 25, $nlPos - $pos - 51)] ?? -1;
 
                 if ($pathId >= 0) {
                     $counts[($pathId * $stride) + $dateIds[substr($chunk, $nlPos - 23, 8)]]++;

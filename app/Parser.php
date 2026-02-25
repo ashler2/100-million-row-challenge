@@ -18,27 +18,28 @@ final class Parser
         $childPid = pcntl_fork();
 
         if ($childPid === -1) {
-            $data = $this->processChunk($inputPath, 0, $fileSize);
+            $flat = $this->processChunk($inputPath, 0, $fileSize);
         } elseif ($childPid === 0) {
-            $data = $this->processChunk($inputPath, $splitPoint, $fileSize);
-            file_put_contents($tmpFile, igbinary_serialize($data));
+            $flat = $this->processChunk($inputPath, $splitPoint, $fileSize);
+            file_put_contents($tmpFile, igbinary_serialize($flat));
             exit(0);
         } else {
-            $data = $this->processChunk($inputPath, 0, $splitPoint);
+            $flat = $this->processChunk($inputPath, 0, $splitPoint);
             pcntl_waitpid($childPid, $status);
 
-            $childData = igbinary_unserialize(file_get_contents($tmpFile));
+            $childFlat = igbinary_unserialize(file_get_contents($tmpFile));
             unlink($tmpFile);
 
-            foreach ($childData as $path => $dates) {
-                if (isset($data[$path])) {
-                    foreach ($dates as $date => $count) {
-                        $data[$path][$date] = ($data[$path][$date] ?? 0) + $count;
-                    }
-                } else {
-                    $data[$path] = $dates;
-                }
+            foreach ($childFlat as $key => $count) {
+                $flat[$key] = ($flat[$key] ?? 0) + $count;
             }
+        }
+
+        $data = [];
+        foreach ($flat as $key => $count) {
+            $path = substr($key, 0, -11);
+            $date = substr($key, -10);
+            $data[$path][$date] = $count;
         }
 
         foreach ($data as $path => &$dates) {
@@ -89,14 +90,12 @@ final class Parser
                     break;
                 }
 
-                $commaPos = $nlPos - 26;
-                $path = substr($chunk, $pos + 19, $commaPos - $pos - 19);
-                $date = substr($chunk, $commaPos + 1, 10);
+                $key = substr($chunk, $pos + 19, $nlPos - $pos - 34);
 
-                if (isset($data[$path][$date])) {
-                    $data[$path][$date]++;
+                if (isset($data[$key])) {
+                    $data[$key]++;
                 } else {
-                    $data[$path][$date] = 1;
+                    $data[$key] = 1;
                 }
 
                 $pos = $nlPos + 1;
@@ -106,15 +105,12 @@ final class Parser
         fclose($fh);
 
         if ($remainder !== '') {
-            $len = strlen($remainder);
-            $commaPos = $len - 25;
-            $path = substr($remainder, 19, $commaPos - 19);
-            $date = substr($remainder, $commaPos + 1, 10);
+            $key = substr($remainder, 19, strlen($remainder) - 34);
 
-            if (isset($data[$path][$date])) {
-                $data[$path][$date]++;
+            if (isset($data[$key])) {
+                $data[$key]++;
             } else {
-                $data[$path][$date] = 1;
+                $data[$key] = 1;
             }
         }
 

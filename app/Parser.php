@@ -167,6 +167,11 @@ final class Parser
             return $counts;
         }
 
+        $pathBases = [];
+        foreach ($pathIds as $p => $id) {
+            $pathBases[$p] = $id * $stride;
+        }
+
         $handle = fopen($inputPath, 'rb');
         stream_set_read_buffer($handle, 0);
         fseek($handle, $start);
@@ -191,15 +196,15 @@ final class Parser
 
             $pos = 0;
             while ($pos < $lastNl) {
-                $nlPos = strpos($chunk, "\n", $pos + 55);
+                $commaPos = strpos($chunk, ",", $pos + 29);
 
-                $pathId = $pathIds[substr($chunk, $pos + 25, $nlPos - $pos - 51)] ?? -1;
+                $base = $pathBases[substr($chunk, $pos + 25, $commaPos - $pos - 25)] ?? -1;
 
-                if ($pathId >= 0) {
-                    $counts[($pathId * $stride) + $dateIds[substr($chunk, $nlPos - 23, 8)]]++;
+                if ($base >= 0) {
+                    $counts[$base + $dateIds[substr($chunk, $commaPos + 3, 8)]]++;
                 }
 
-                $pos = $nlPos + 1;
+                $pos = $commaPos + 27;
             }
         }
 

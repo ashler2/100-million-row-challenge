@@ -4,6 +4,31 @@ declare(strict_types=1);
 
 namespace App;
 
+use function array_fill;
+use function chr;
+use function fclose;
+use function fgets;
+use function filesize;
+use function fopen;
+use function fread;
+use function fseek;
+use function ftell;
+use function ftok;
+use function fwrite;
+use function pack;
+use function pcntl_fork;
+use function pcntl_waitpid;
+use function shmop_delete;
+use function shmop_open;
+use function shmop_read;
+use function shmop_write;
+use function stream_set_read_buffer;
+use function stream_set_write_buffer;
+use function strlen;
+use function strpos;
+use function strrpos;
+use function substr;
+use function unpack;
 use const SEEK_CUR;
 
 final class Parser

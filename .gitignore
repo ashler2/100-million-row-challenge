@@ -9,3 +9,4 @@ test-data-actual.json
 .tempest
 .env
 .DS_Store
+.dockerignore

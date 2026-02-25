@@ -21,14 +21,13 @@ final class Parser
             $data = $this->processChunk($inputPath, 0, $fileSize);
         } elseif ($childPid === 0) {
             $data = $this->processChunk($inputPath, $splitPoint, $fileSize);
-            file_put_contents($tmpFile, function_exists('igbinary_serialize') ? igbinary_serialize($data) : serialize($data));
+            file_put_contents($tmpFile, igbinary_serialize($data));
             exit(0);
         } else {
             $data = $this->processChunk($inputPath, 0, $splitPoint);
             pcntl_waitpid($childPid, $status);
 
-            $raw = file_get_contents($tmpFile);
-            $childData = function_exists('igbinary_unserialize') ? igbinary_unserialize($raw) : unserialize($raw);
+            $childData = igbinary_unserialize(file_get_contents($tmpFile));
             unlink($tmpFile);
 
             foreach ($childData as $path => $dates) {

@@ -5,13 +5,10 @@ declare(strict_types=1);
 namespace App;
 
 use const SEEK_CUR;
-use const STREAM_IPPROTO_IP;
-use const STREAM_PF_UNIX;
-use const STREAM_SOCK_STREAM;
 
 final class Parser
 {
-    private const int WORKERS = 8;
+    private const int WORKERS = 4;
 
     public function parse(string $inputPath, string $outputPath): void
     {
@@ -28,6 +25,28 @@ final class Parser
         fclose($handle);
         $boundaries[] = $fileSize;
 
+        $dateIds = [];
+        $dates = [];
+        $dateCount = 0;
+        for ($y = 20; $y <= 26; $y++) {
+            $yStr = ($y < 10 ? '0' : '') . $y;
+            for ($m = 1; $m <= 12; $m++) {
+                $mStr = ($m < 10 ? '0' : '') . $m;
+                $daysInMonth = match ($m) {
+                    2 => (($y + 2000) % 4 === 0) ? 29 : 28,
+                    4, 6, 9, 11 => 30,
+                    default => 31,
+                };
+                for ($d = 1; $d <= $daysInMonth; $d++) {
+                    $dStr = ($d < 10 ? '0' : '') . $d;
+                    $key = $yStr . '-' . $mStr . '-' . $dStr;
+                    $dateIds[$key] = $dateCount;
+                    $dates[$dateCount] = $key;
+                    $dateCount++;
+                }
+            }
+        }
+
         $handle = fopen($inputPath, 'rb');
         stream_set_read_buffer($handle, 0);
         $warmUpSize = $fileSize > 16_777_216 ? 16_777_216 : $fileSize;
@@ -39,11 +58,6 @@ final class Parser
         $pathIds = [];
         $paths = [];
         $pathCount = 0;
-
-        $dateIds = [];
-        $dates = [];
-        $dateCount = 0;
-
         $warmUpCounts = [];
 
         if ($lastNl !== false) {
@@ -52,24 +66,16 @@ final class Parser
                 $nlPos = strpos($chunk, "\n", $pos + 55);
 
                 $path = substr($chunk, $pos + 25, $nlPos - $pos - 51);
-                $pathId = $pathIds[$path] ?? $pathCount;
+                $pathId = $pathIds[$path] ?? -1;
 
-                if ($pathId === $pathCount) {
+                if ($pathId === -1) {
+                    $pathId = $pathCount;
                     $pathIds[$path] = $pathId;
                     $paths[$pathCount] = $path;
                     $pathCount++;
                 }
 
-                $dateStr = substr($chunk, $nlPos - 23, 8);
-                $dateId = $dateIds[$dateStr] ?? -1;
-
-                if ($dateId === -1) {
-                    $dateId = $dateCount;
-                    $dateIds[$dateStr] = $dateId;
-                    $dates[$dateCount] = $dateStr;
-                    $dateCount++;
-                }
-
+                $dateId = $dateIds[substr($chunk, $nlPos - 23, 8)];
                 $warmUpCounts[$pathId][$dateId] = ($warmUpCounts[$pathId][$dateId] ?? 0) + 1;
                 $pos = $nlPos + 1;
             }
@@ -104,35 +110,25 @@ final class Parser
             }
         }
 
-        $pipes = [];
+        $tmpDir = sys_get_temp_dir();
+        $myPid = getmypid();
+        $tmpFiles = [];
         $pids = [];
 
         for ($i = 0; $i < $workers - 1; $i++) {
-            $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+            $tmpFile = $tmpDir . '/parse_' . $myPid . '_' . $i;
+            $tmpFiles[$i] = $tmpFile;
             $pid = pcntl_fork();
 
             if ($pid === 0) {
-                foreach ($pipes as $p) {
-                    fclose($p);
-                }
-                fclose($pair[0]);
                 $data = self::processChunk(
                     $inputPath, $boundaries[$i], $boundaries[$i + 1],
                     $pathIds, $dateIds, $pathCount, $dateCount, $quickPath,
                 );
-                $binary = pack('V*', ...$data);
-                $len = strlen($binary);
-                $written = 0;
-                while ($written < $len) {
-                    $w = fwrite($pair[1], substr($binary, $written, 262144));
-                    $written += $w;
-                }
-                fclose($pair[1]);
+                file_put_contents($tmpFile, pack('V*', ...$data));
                 exit(0);
             }
 
-            fclose($pair[1]);
-            $pipes[$i] = $pair[0];
             $pids[$i] = $pid;
         }
 
@@ -141,28 +137,27 @@ final class Parser
             $pathIds, $dateIds, $pathCount, $dateCount, $quickPath,
         );
 
+        foreach ($pids as $pid) {
+            pcntl_waitpid($pid, $status);
+        }
+
         $total = $pathCount * $dateCount;
         $mergedCounts = $warmUpFlat;
         unset($warmUpFlat);
-
-        foreach ($pipes as $i => $pipe) {
-            $wCounts = unpack('V*', stream_get_contents($pipe));
-            fclose($pipe);
-            pcntl_waitpid($pids[$i], $status);
-
-            $j = 0;
-            foreach ($wCounts as $v) {
-                $mergedCounts[$j++] += $v;
-            }
-        }
 
         for ($j = 0; $j < $total; $j++) {
             $mergedCounts[$j] += $parentCounts[$j];
         }
         unset($parentCounts);
 
-        $sortedDates = $dates;
-        asort($sortedDates);
+        foreach ($tmpFiles as $tmpFile) {
+            $wCounts = unpack('V*', file_get_contents($tmpFile));
+            unlink($tmpFile);
+            $j = 0;
+            foreach ($wCounts as $v) {
+                $mergedCounts[$j++] += $v;
+            }
+        }
 
         $out = fopen($outputPath, 'wb');
         stream_set_write_buffer($out, 1_048_576);
@@ -178,12 +173,12 @@ final class Parser
             $base = $pathId * $dateCount;
             $sep = "\n";
 
-            foreach ($sortedDates as $dateId => $dateStr) {
+            for ($dateId = 0; $dateId < $dateCount; $dateId++) {
                 $count = $mergedCounts[$base + $dateId];
                 if ($count === 0) {
                     continue;
                 }
-                $buf .= "{$sep}        \"20{$dateStr}\": {$count}";
+                $buf .= "{$sep}        \"20{$dates[$dateId]}\": {$count}";
                 $sep = ",\n";
             }
 
@@ -219,7 +214,7 @@ final class Parser
         $remaining = $end - $start;
 
         while ($remaining > 0) {
-            $chunk = fread($handle, $remaining > 4_194_304 ? 4_194_304 : $remaining);
+            $chunk = fread($handle, $remaining > 8_388_608 ? 8_388_608 : $remaining);
             $chunkLen = strlen($chunk);
             $remaining -= $chunkLen;
 
@@ -240,37 +235,13 @@ final class Parser
                 $pathId = $quickPath[$nlPos - $pos - 51][$chunk[$pos + 25]][$chunk[$nlPos - 27]] ?? -1;
 
                 if ($pathId < 0) {
-                    $path = substr($chunk, $pos + 25, $nlPos - $pos - 51);
-                    $pathId = $pathIds[$path] ?? $pathCount;
-                    if ($pathId === $pathCount) {
-                        $pathIds[$path] = $pathId;
-                        for ($j = 0; $j < $stride; $j++) {
-                            $counts[($pathCount * $stride) + $j] = 0;
-                        }
-                        $pathCount++;
-                    }
+                    $pathId = $pathIds[substr($chunk, $pos + 25, $nlPos - $pos - 51)] ?? -1;
                 }
 
-                $dateId = $dateIds[substr($chunk, $nlPos - 23, 8)] ?? -1;
-                if ($dateId === -1) {
-                    $dateStr = substr($chunk, $nlPos - 23, 8);
-                    $dateId = $dateCount;
-                    $dateIds[$dateStr] = $dateId;
-                    $newStride = $stride + 1;
-                    $newCounts = array_fill(0, $pathCount * $newStride, 0);
-                    for ($j = 0; $j < $pathCount; $j++) {
-                        $srcBase = $j * $stride;
-                        $dstBase = $j * $newStride;
-                        for ($k = 0; $k < $dateCount; $k++) {
-                            $newCounts[$dstBase + $k] = $counts[$srcBase + $k];
-                        }
-                    }
-                    $counts = $newCounts;
-                    $stride = $newStride;
-                    $dateCount++;
+                if ($pathId >= 0) {
+                    $counts[($pathId * $stride) + $dateIds[substr($chunk, $nlPos - 23, 8)]]++;
                 }
 
-                $counts[($pathId * $stride) + $dateId]++;
                 $pos = $nlPos + 1;
             }
         }

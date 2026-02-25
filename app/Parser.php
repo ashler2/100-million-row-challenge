@@ -8,7 +8,7 @@ use const SEEK_CUR;
 
 final class Parser
 {
-    private const int WORKERS = 4;
+    private const int WORKERS = 3;
 
     public function parse(string $inputPath, string $outputPath): void
     {
@@ -110,14 +110,15 @@ final class Parser
             }
         }
 
-        $tmpDir = sys_get_temp_dir();
-        $myPid = getmypid();
-        $tmpFiles = [];
+        $total = $pathCount * $dateCount;
+        $shmSize = $total * 4;
+        $shmIds = [];
         $pids = [];
 
         for ($i = 0; $i < $workers - 1; $i++) {
-            $tmpFile = $tmpDir . '/parse_' . $myPid . '_' . $i;
-            $tmpFiles[$i] = $tmpFile;
+            $shmKey = ftok($inputPath, chr(65 + $i));
+            $shmId = shmop_open($shmKey, 'c', 0644, $shmSize);
+            $shmIds[$i] = [$shmKey, $shmId];
             $pid = pcntl_fork();
 
             if ($pid === 0) {
@@ -125,7 +126,7 @@ final class Parser
                     $inputPath, $boundaries[$i], $boundaries[$i + 1],
                     $pathIds, $dateIds, $pathCount, $dateCount, $quickPath,
                 );
-                file_put_contents($tmpFile, pack('V*', ...$data));
+                shmop_write($shmId, pack('V*', ...$data), 0);
                 exit(0);
             }
 
@@ -141,7 +142,6 @@ final class Parser
             pcntl_waitpid($pid, $status);
         }
 
-        $total = $pathCount * $dateCount;
         $mergedCounts = $warmUpFlat;
         unset($warmUpFlat);
 
@@ -150,9 +150,9 @@ final class Parser
         }
         unset($parentCounts);
 
-        foreach ($tmpFiles as $tmpFile) {
-            $wCounts = unpack('V*', file_get_contents($tmpFile));
-            unlink($tmpFile);
+        foreach ($shmIds as [$shmKey, $shmId]) {
+            $wCounts = unpack('V*', shmop_read($shmId, 0, $shmSize));
+            shmop_delete($shmId);
             $j = 0;
             foreach ($wCounts as $v) {
                 $mergedCounts[$j++] += $v;
@@ -214,7 +214,7 @@ final class Parser
         $remaining = $end - $start;
 
         while ($remaining > 0) {
-            $chunk = fread($handle, $remaining > 8_388_608 ? 8_388_608 : $remaining);
+            $chunk = fread($handle, $remaining > 33_554_432 ? 33_554_432 : $remaining);
             $chunkLen = strlen($chunk);
             $remaining -= $chunkLen;
 

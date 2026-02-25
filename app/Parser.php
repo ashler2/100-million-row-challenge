@@ -37,6 +37,7 @@ final class Parser
 
     public function parse(string $inputPath, string $outputPath): void
     {
+        gc_disable();
         $fileSize = filesize($inputPath);
         $workers = self::WORKERS;
 
@@ -192,11 +193,6 @@ final class Parser
             return $counts;
         }
 
-        $pathBases = [];
-        foreach ($pathIds as $p => $id) {
-            $pathBases[$p] = $id * $stride;
-        }
-
         $handle = fopen($inputPath, 'rb');
         stream_set_read_buffer($handle, 0);
         fseek($handle, $start);
@@ -204,8 +200,7 @@ final class Parser
         $remaining = $end - $start;
 
         while ($remaining > 0) {
-            $readSize = $remaining > 33_554_432 ? 33_554_432 : $remaining;
-            $chunk = fread($handle, $readSize);
+            $chunk = fread($handle, $remaining > 33_554_432 ? 33_554_432 : $remaining);
             $chunkLen = strlen($chunk);
             $remaining -= $chunkLen;
 
@@ -213,7 +208,7 @@ final class Parser
             if ($lastNl === false) {
                 break;
             }
-            if ($lastNl < ($chunkLen - 1)) {
+            if ($lastNl < $chunkLen - 1) {
                 $excess = $chunkLen - $lastNl - 1;
                 fseek($handle, -$excess, SEEK_CUR);
                 $remaining += $excess;
@@ -221,15 +216,11 @@ final class Parser
 
             $pos = 0;
             while ($pos < $lastNl) {
-                $commaPos = strpos($chunk, ",", $pos + 29);
+                $nlPos = strpos($chunk, "\n", $pos + 52);
 
-                $base = $pathBases[substr($chunk, $pos + 25, $commaPos - $pos - 25)] ?? -1;
+                $counts[$pathIds[substr($chunk, $pos + 25, $nlPos - $pos - 51)] * $stride + $dateIds[substr($chunk, $nlPos - 23, 8)]]++;
 
-                if ($base >= 0) {
-                    $counts[$base + $dateIds[substr($chunk, $commaPos + 3, 8)]]++;
-                }
-
-                $pos = $commaPos + 27;
+                $pos = $nlPos + 1;
             }
         }
 

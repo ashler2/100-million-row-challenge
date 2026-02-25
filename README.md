@@ -75,6 +75,10 @@ Your parser should store the following output in `$outputPath` as a JSON file:
 
 Send a pull request to this repository with your solution. The title of your pull request should simply be your GitHub's username. If your solution validates, we'll run it on the benchmark server and store your time in [leaderboard.csv](./leaderboard.csv). You can continue to improve your solution, but keep in mind that benchmarks are manually triggered, and you might need to wait a while before your results are published.
 
+## A note on copying other branches
+
+You might be tempted to look for inspiration from other competitors. While we have no means of preventing you from doing that, we will remove submissions that have clearly been copied from other submissions. We validate each submission by hand up front and ask you to come up with an original solution of your own.
+
 ## FAQ
 
 #### What can I win?

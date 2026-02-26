@@ -4,6 +4,7 @@ namespace App;
 
 use App\Commands\Visit;
 
+use function array_count_values;
 use function array_fill;
 use function chr;
 use function fclose;
@@ -37,7 +38,7 @@ use const SEEK_CUR;
 final class Parser
 {
     private const int CHUNK_BYTES = 8_388_608;
-    private const int PROBE_BYTES = 1_048_576;
+    private const int PROBE_BYTES = 2_097_152;
 
     public function parse($inputPath, $outputPath)
     {
@@ -228,8 +229,8 @@ final class Parser
         for ($p = 0; $p < $pathCount; $p++) {
             if ($buckets[$p] === '') continue;
             $offset = $p * $dateCount;
-            foreach (unpack('v*', $buckets[$p]) as $did) {
-                $counts[$offset + $did]++;
+            foreach (array_count_values(unpack('v*', $buckets[$p])) as $did => $count) {
+                $counts[$offset + $did] += $count;
             }
         }
 
@@ -254,7 +255,7 @@ final class Parser
             $escapedPaths[$p] = "\"\\/blog\\/" . str_replace('/', '\\/', $paths[$p]) . "\"";
         }
 
-        $buf = '{';
+        fwrite($out, '{');
         $firstPath = true;
 
         for ($p = 0; $p < $pathCount; $p++) {
@@ -271,20 +272,17 @@ final class Parser
 
             if ($body === '') continue;
 
-            $buf .= ($firstPath ? '' : ',')
+            fwrite(
+                $out,
+                ($firstPath ? '' : ',')
                 . "\n    " . $escapedPaths[$p] . ": {\n"
                 . $body
-                . "\n    }";
+                . "\n    }",
+            );
             $firstPath = false;
-
-            if (strlen($buf) > 65536) {
-                fwrite($out, $buf);
-                $buf = '';
-            }
         }
 
-        $buf .= "\n}";
-        fwrite($out, $buf);
+        fwrite($out, "\n}");
         fclose($out);
     }
 }

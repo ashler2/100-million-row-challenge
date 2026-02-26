@@ -33,7 +33,7 @@ use const SEEK_CUR;
 
 final class Parser
 {
-    private const int WORKERS = 3;
+    private const int WORKERS = 4;
 
     public function parse(string $inputPath, string $outputPath): void
     {
@@ -200,7 +200,7 @@ final class Parser
         $remaining = $end - $start;
 
         while ($remaining > 0) {
-            $chunk = fread($handle, $remaining > 33_554_432 ? 33_554_432 : $remaining);
+            $chunk = fread($handle, $remaining > 1_048_576 ? 1_048_576 : $remaining);
             $chunkLen = strlen($chunk);
             $remaining -= $chunkLen;
 

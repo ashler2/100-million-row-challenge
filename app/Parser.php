@@ -12,6 +12,7 @@ use function file_get_contents;
 use function file_put_contents;
 use function filesize;
 use function fopen;
+use function gc_disable;
 use function fread;
 use function fseek;
 use function ftell;

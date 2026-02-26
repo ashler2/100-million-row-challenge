@@ -4,36 +4,37 @@ declare(strict_types=1);
 
 namespace App;
 
+use App\Commands\Visit;
 use function array_fill;
-use function chr;
 use function fclose;
 use function fgets;
+use function file_get_contents;
+use function file_put_contents;
 use function filesize;
 use function fopen;
 use function fread;
 use function fseek;
 use function ftell;
-use function ftok;
 use function fwrite;
+use function getmypid;
+use function is_dir;
 use function pack;
 use function pcntl_fork;
 use function pcntl_waitpid;
-use function shmop_delete;
-use function shmop_open;
-use function shmop_read;
-use function shmop_write;
 use function stream_set_read_buffer;
 use function stream_set_write_buffer;
 use function strlen;
 use function strpos;
 use function strrpos;
 use function substr;
+use function sys_get_temp_dir;
+use function unlink;
 use function unpack;
 use const SEEK_CUR;
 
 final class Parser
 {
-    private const int WORKERS = 4;
+    private const int WORKERS = 8;
 
     public function parse(string $inputPath, string $outputPath): void
     {
@@ -88,7 +89,7 @@ final class Parser
         if ($lastNl !== false) {
             $pos = 0;
             while ($pos < $lastNl) {
-                $nlPos = strpos($chunk, "\n", $pos + 55);
+                $nlPos = strpos($chunk, "\n", $pos + 52);
 
                 $path = substr($chunk, $pos + 25, $nlPos - $pos - 51);
                 if (!isset($pathIds[$path])) {
@@ -102,15 +103,23 @@ final class Parser
         }
         unset($chunk);
 
-        $total = $pathCount * $dateCount;
-        $shmSize = $total * 4;
-        $shmIds = [];
+        foreach (Visit::all() as $visit) {
+            $path = substr($visit->uri, 25);
+            if (!isset($pathIds[$path])) {
+                $pathIds[$path] = $pathCount;
+                $paths[$pathCount] = $path;
+                $pathCount++;
+            }
+        }
+
+        $tmpDir = is_dir('/dev/shm') ? '/dev/shm' : sys_get_temp_dir();
+        $myPid = getmypid();
+        $tmpFiles = [];
         $pids = [];
 
         for ($i = 0; $i < $workers - 1; $i++) {
-            $shmKey = ftok($inputPath, chr(65 + $i));
-            $shmId = shmop_open($shmKey, 'c', 0644, $shmSize);
-            $shmIds[$i] = [$shmKey, $shmId];
+            $tmpFile = $tmpDir . '/p100m_' . $myPid . '_' . $i;
+            $tmpFiles[$i] = $tmpFile;
             $pid = pcntl_fork();
 
             if ($pid === 0) {
@@ -118,14 +127,14 @@ final class Parser
                     $inputPath, $boundaries[$i], $boundaries[$i + 1],
                     $pathIds, $dateIds, $pathCount, $dateCount,
                 );
-                shmop_write($shmId, pack('V*', ...$data), 0);
+                file_put_contents($tmpFile, pack('V*', ...$data));
                 exit(0);
             }
 
             $pids[$i] = $pid;
         }
 
-        $parentCounts = self::processChunk(
+        $mergedCounts = self::processChunk(
             $inputPath, $boundaries[$workers - 1], $boundaries[$workers],
             $pathIds, $dateIds, $pathCount, $dateCount,
         );
@@ -134,12 +143,9 @@ final class Parser
             pcntl_waitpid($pid, $status);
         }
 
-        $mergedCounts = $parentCounts;
-        unset($parentCounts);
-
-        foreach ($shmIds as [$shmKey, $shmId]) {
-            $wCounts = unpack('V*', shmop_read($shmId, 0, $shmSize));
-            shmop_delete($shmId);
+        foreach ($tmpFiles as $tmpFile) {
+            $wCounts = unpack('V*', file_get_contents($tmpFile));
+            unlink($tmpFile);
             $j = 0;
             foreach ($wCounts as $v) {
                 $mergedCounts[$j++] += $v;
@@ -153,11 +159,8 @@ final class Parser
         $firstPath = true;
 
         foreach ($paths as $pathId => $path) {
-            $buf = $firstPath ? '' : ',';
-            $firstPath = false;
-            $buf .= "\n    \"\/blog\/{$path}\": {";
-
             $base = $pathId * $dateCount;
+            $buf = '';
             $sep = "\n";
 
             for ($dateId = 0; $dateId < $dateCount; $dateId++) {
@@ -169,8 +172,12 @@ final class Parser
                 $sep = ",\n";
             }
 
-            $buf .= "\n    }";
-            fwrite($out, $buf);
+            if ($buf === '') {
+                continue;
+            }
+
+            fwrite($out, ($firstPath ? '' : ',') . "\n    \"\/blog\/{$path}\": {" . $buf . "\n    }");
+            $firstPath = false;
         }
 
         fwrite($out, "\n}");
@@ -191,6 +198,11 @@ final class Parser
 
         if ($start >= $end) {
             return $counts;
+        }
+
+        $pathBases = [];
+        foreach ($pathIds as $p => $id) {
+            $pathBases[$p] = $id * $stride;
         }
 
         $handle = fopen($inputPath, 'rb');
@@ -218,7 +230,7 @@ final class Parser
             while ($pos < $lastNl) {
                 $nlPos = strpos($chunk, "\n", $pos + 52);
 
-                $counts[$pathIds[substr($chunk, $pos + 25, $nlPos - $pos - 51)] * $stride + $dateIds[substr($chunk, $nlPos - 23, 8)]]++;
+                $counts[$pathBases[substr($chunk, $pos + 25, $nlPos - $pos - 51)] + $dateIds[substr($chunk, $nlPos - 23, 8)]]++;
 
                 $pos = $nlPos + 1;
             }

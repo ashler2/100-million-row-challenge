@@ -19,6 +19,9 @@ use function ftell;
 use function fwrite;
 use function gc_disable;
 use function getmypid;
+use function implode;
+use function max;
+use function ord;
 use function pack;
 use function pcntl_fork;
 use function pcntl_waitpid;
@@ -37,7 +40,7 @@ use const SEEK_CUR;
 
 final class Parser
 {
-    private const int CHUNK_BYTES = 8_388_608;
+    private const int CHUNK_BYTES = 163_840;
     private const int PROBE_BYTES = 2_097_152;
 
     public function parse($inputPath, $outputPath)
@@ -45,7 +48,7 @@ final class Parser
         gc_disable();
         $fileSize = filesize($inputPath);
 
-        $workers = 10;
+        $workers = 12;
 
         $dateIds = [];
         $dates = [];
@@ -135,7 +138,9 @@ final class Parser
                     $inputPath, $boundaries[$i], $boundaries[$i + 1],
                     $pathIds, $dateIdChars, $pathCount, $dateCount,
                 );
-                file_put_contents($tmpFile, pack('V*', ...$data));
+                $use16 = max($data) <= 65535;
+                $flag = $use16 ? "\x00" : "\x01";
+                file_put_contents($tmpFile, $flag . pack($use16 ? 'v*' : 'V*', ...$data));
                 exit(0);
             }
 
@@ -149,8 +154,10 @@ final class Parser
 
         foreach ($children as [$cpid, $tmpFile]) {
             pcntl_waitpid($cpid, $status);
-            $wCounts = unpack('V*', file_get_contents($tmpFile));
+            $raw = file_get_contents($tmpFile);
             unlink($tmpFile);
+            $fmt = ord($raw[0]) === 0 ? 'v*' : 'V*';
+            $wCounts = unpack($fmt, $raw, 1);
             $j = 0;
             foreach ($wCounts as $v) {
                 $mergedCounts[$j++] += $v;
@@ -260,23 +267,21 @@ final class Parser
 
         for ($p = 0; $p < $pathCount; $p++) {
             $base = $p * $dateCount;
-            $body = '';
-            $comma = '';
+            $dateEntries = [];
 
             for ($d = 0; $d < $dateCount; $d++) {
                 $count = $counts[$base + $d];
                 if ($count === 0) continue;
-                $body .= $comma . $datePrefixes[$d] . $count;
-                $comma = ",\n";
+                $dateEntries[] = $datePrefixes[$d] . $count;
             }
 
-            if ($body === '') continue;
+            if ($dateEntries === []) continue;
 
             fwrite(
                 $out,
                 ($firstPath ? '' : ',')
                 . "\n    " . $escapedPaths[$p] . ": {\n"
-                . $body
+                . implode(",\n", $dateEntries)
                 . "\n    }",
             );
             $firstPath = false;

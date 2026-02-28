@@ -7,6 +7,7 @@ use App\Commands\Visit;
 use function array_count_values;
 use function array_fill;
 use function chr;
+use function count;
 use function fclose;
 use function fgets;
 use function file_get_contents;
@@ -19,12 +20,9 @@ use function ftell;
 use function fwrite;
 use function gc_disable;
 use function getmypid;
-use function implode;
-use function max;
-use function ord;
 use function pack;
 use function pcntl_fork;
-use function pcntl_waitpid;
+use function pcntl_wait;
 use function stream_set_read_buffer;
 use function stream_set_write_buffer;
 use function str_replace;
@@ -37,10 +35,12 @@ use function unlink;
 use function unpack;
 
 use const SEEK_CUR;
+use const WNOHANG;
 
 final class Parser
 {
-    private const int CHUNK_BYTES = 163_840;
+    private const int WORKERS = 10;
+    private const int READ_BYTES = 2_097_152;
     private const int PROBE_BYTES = 2_097_152;
 
     public function parse($inputPath, $outputPath)
@@ -48,10 +48,8 @@ final class Parser
         gc_disable();
         $fileSize = filesize($inputPath);
 
-        $workers = 12;
-
-        $dateIds = [];
-        $dates = [];
+        $dateChars = [];
+        $dateMap = [];
         $dateCount = 0;
         for ($y = 20; $y <= 26; $y++) {
             for ($m = 1; $m <= 12; $m++) {
@@ -63,17 +61,13 @@ final class Parser
                 $mStr = ($m < 10 ? '0' : '') . $m;
                 $ymStr = $y . '-' . $mStr . '-';
                 for ($d = 1; $d <= $maxD; $d++) {
-                    $key = $ymStr . (($d < 10 ? '0' : '') . $d);
-                    $dateIds[$key] = $dateCount;
-                    $dates[$dateCount] = $key;
+                    $dStr = ($d < 10 ? '0' : '') . $d;
+                    $shortKey = substr((string)$y, 1) . '-' . $mStr . '-' . $dStr;
+                    $dateChars[$shortKey] = chr($dateCount & 0xFF) . chr($dateCount >> 8);
+                    $dateMap[$dateCount] = '20' . $ymStr . $dStr;
                     $dateCount++;
                 }
             }
-        }
-
-        $dateIdChars = [];
-        foreach ($dateIds as $date => $id) {
-            $dateIdChars[$date] = chr($id & 0xFF) . chr($id >> 8);
         }
 
         $handle = fopen($inputPath, 'rb');
@@ -115,10 +109,20 @@ final class Parser
             }
         }
 
+        $datePrefixes = [];
+        for ($d = 0; $d < $dateCount; $d++) {
+            $datePrefixes[$d] = '        "' . $dateMap[$d] . '": ';
+        }
+
+        $pathPrefixes = [];
+        for ($p = 0; $p < $pathCount; $p++) {
+            $pathPrefixes[$p] = "\n    \"\\/blog\\/" . str_replace('/', '\\/', $paths[$p]) . "\": {";
+        }
+
         $boundaries = [0];
         $handle = fopen($inputPath, 'rb');
-        for ($i = 1; $i < $workers; $i++) {
-            fseek($handle, (int) ($fileSize * $i / $workers));
+        for ($i = 1; $i < self::WORKERS; $i++) {
+            fseek($handle, (int) ($fileSize * $i / self::WORKERS));
             fgets($handle);
             $boundaries[] = ftell($handle);
         }
@@ -127,167 +131,159 @@ final class Parser
 
         $tmpDir = sys_get_temp_dir();
         $myPid = getmypid();
-        $children = [];
+        $childMap = [];
 
-        for ($i = 0; $i < $workers - 1; $i++) {
-            $tmpFile = $tmpDir . '/p100m_' . $myPid . '_' . $i;
+        for ($w = 0; $w < self::WORKERS - 1; $w++) {
+            $tmpFile = $tmpDir . '/p100m_' . $myPid . '_' . $w;
             $pid = pcntl_fork();
 
             if ($pid === 0) {
-                $data = $this->processChunk(
-                    $inputPath, $boundaries[$i], $boundaries[$i + 1],
-                    $pathIds, $dateIdChars, $pathCount, $dateCount,
-                );
-                $use16 = max($data) <= 65535;
-                $flag = $use16 ? "\x00" : "\x01";
-                file_put_contents($tmpFile, $flag . pack($use16 ? 'v*' : 'V*', ...$data));
+                $buckets = array_fill(0, $pathCount, '');
+                $this->fillBuckets($inputPath, $boundaries[$w], $boundaries[$w + 1], $pathIds, $dateChars, $buckets);
+                $counts = $this->bucketsToCounts($buckets, $pathCount, $dateCount);
+                file_put_contents($tmpFile, pack('v*', ...$counts));
                 exit(0);
             }
 
-            $children[] = [$pid, $tmpFile];
+            $childMap[$pid] = $tmpFile;
         }
 
-        $mergedCounts = $this->processChunk(
-            $inputPath, $boundaries[$workers - 1], $boundaries[$workers],
-            $pathIds, $dateIdChars, $pathCount, $dateCount,
-        );
+        $buckets = array_fill(0, $pathCount, '');
+        $this->fillBuckets($inputPath, $boundaries[self::WORKERS - 1], $boundaries[self::WORKERS], $pathIds, $dateChars, $buckets);
+        $counts = $this->bucketsToCounts($buckets, $pathCount, $dateCount);
 
-        foreach ($children as [$cpid, $tmpFile]) {
-            pcntl_waitpid($cpid, $status);
-            $raw = file_get_contents($tmpFile);
-            unlink($tmpFile);
-            $fmt = ord($raw[0]) === 0 ? 'v*' : 'V*';
-            $wCounts = unpack($fmt, $raw, 1);
+        $pending = count($childMap);
+        while ($pending > 0) {
+            $pid = pcntl_wait($status, WNOHANG);
+            if ($pid <= 0) {
+                $pid = pcntl_wait($status);
+            }
+            if (!isset($childMap[$pid])) continue;
+            $wCounts = unpack('v*', file_get_contents($childMap[$pid]));
+            unlink($childMap[$pid]);
             $j = 0;
             foreach ($wCounts as $v) {
-                $mergedCounts[$j++] += $v;
+                $counts[$j++] += $v;
             }
+            $pending--;
         }
 
-        $this->writeJson($outputPath, $mergedCounts, $paths, $dates, $dateCount);
+        $this->writeJson($outputPath, $counts, $pathPrefixes, $datePrefixes, $pathCount, $dateCount);
     }
 
-    private function processChunk(
-        $inputPath, $start, $end,
-        $pathIds, $dateIdChars,
-        $pathCount, $dateCount,
-    ) {
-        $buckets = array_fill(0, $pathCount, '');
+    private function fillBuckets($inputPath, $start, $end, $pathIds, $dateChars, &$buckets)
+    {
         $handle = fopen($inputPath, 'rb');
         stream_set_read_buffer($handle, 0);
         fseek($handle, $start);
-        $remaining = $end - $start;
+        $processed = 0;
+        $toProcess = $end - $start;
 
-        while ($remaining > 0) {
-            $chunk = fread($handle, $remaining > self::CHUNK_BYTES ? self::CHUNK_BYTES : $remaining);
+        while ($processed < $toProcess) {
+            $remaining = $toProcess - $processed;
+            $chunk = fread($handle, $remaining > self::READ_BYTES ? self::READ_BYTES : $remaining);
+            if (!$chunk) break;
+
             $chunkLen = strlen($chunk);
-            if ($chunkLen === 0) break;
-            $remaining -= $chunkLen;
-
             $lastNl = strrpos($chunk, "\n");
-            if ($lastNl === false) break;
+            if ($lastNl === false) continue;
 
             $tail = $chunkLen - $lastNl - 1;
             if ($tail > 0) {
                 fseek($handle, -$tail, SEEK_CUR);
-                $remaining += $tail;
+            }
+            $processed += $lastNl + 1;
+
+            $p = 25;
+            $fence = $lastNl - 600;
+
+            while ($p < $fence) {
+                $sep = strpos($chunk, ',', $p);
+                $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateChars[substr($chunk, $sep + 4, 7)];
+                $p = $sep + 52;
+
+                $sep = strpos($chunk, ',', $p);
+                $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateChars[substr($chunk, $sep + 4, 7)];
+                $p = $sep + 52;
+
+                $sep = strpos($chunk, ',', $p);
+                $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateChars[substr($chunk, $sep + 4, 7)];
+                $p = $sep + 52;
+
+                $sep = strpos($chunk, ',', $p);
+                $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateChars[substr($chunk, $sep + 4, 7)];
+                $p = $sep + 52;
+
+                $sep = strpos($chunk, ',', $p);
+                $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateChars[substr($chunk, $sep + 4, 7)];
+                $p = $sep + 52;
             }
 
-            $pos = 0;
-            $fence = $lastNl - 720;
-
-            while ($pos < $fence) {
-                $nlPos = strpos($chunk, "\n", $pos + 52);
-                $buckets[$pathIds[substr($chunk, $pos + 25, $nlPos - $pos - 51)]] .= $dateIdChars[substr($chunk, $nlPos - 23, 8)];
-                $pos = $nlPos + 1;
-
-                $nlPos = strpos($chunk, "\n", $pos + 52);
-                $buckets[$pathIds[substr($chunk, $pos + 25, $nlPos - $pos - 51)]] .= $dateIdChars[substr($chunk, $nlPos - 23, 8)];
-                $pos = $nlPos + 1;
-
-                $nlPos = strpos($chunk, "\n", $pos + 52);
-                $buckets[$pathIds[substr($chunk, $pos + 25, $nlPos - $pos - 51)]] .= $dateIdChars[substr($chunk, $nlPos - 23, 8)];
-                $pos = $nlPos + 1;
-
-                $nlPos = strpos($chunk, "\n", $pos + 52);
-                $buckets[$pathIds[substr($chunk, $pos + 25, $nlPos - $pos - 51)]] .= $dateIdChars[substr($chunk, $nlPos - 23, 8)];
-                $pos = $nlPos + 1;
-
-                $nlPos = strpos($chunk, "\n", $pos + 52);
-                $buckets[$pathIds[substr($chunk, $pos + 25, $nlPos - $pos - 51)]] .= $dateIdChars[substr($chunk, $nlPos - 23, 8)];
-                $pos = $nlPos + 1;
-
-                $nlPos = strpos($chunk, "\n", $pos + 52);
-                $buckets[$pathIds[substr($chunk, $pos + 25, $nlPos - $pos - 51)]] .= $dateIdChars[substr($chunk, $nlPos - 23, 8)];
-                $pos = $nlPos + 1;
-            }
-
-            while ($pos < $lastNl) {
-                $nlPos = strpos($chunk, "\n", $pos + 52);
-                if ($nlPos === false) break;
-                $buckets[$pathIds[substr($chunk, $pos + 25, $nlPos - $pos - 51)]] .= $dateIdChars[substr($chunk, $nlPos - 23, 8)];
-                $pos = $nlPos + 1;
+            while ($p < $lastNl) {
+                $sep = strpos($chunk, ',', $p);
+                if ($sep === false || $sep >= $lastNl) break;
+                $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateChars[substr($chunk, $sep + 4, 7)];
+                $p = $sep + 52;
             }
         }
 
         fclose($handle);
+    }
 
+    private function bucketsToCounts(&$buckets, $pathCount, $dateCount)
+    {
         $counts = array_fill(0, $pathCount * $dateCount, 0);
-        for ($p = 0; $p < $pathCount; $p++) {
-            if ($buckets[$p] === '') continue;
-            $offset = $p * $dateCount;
-            foreach (array_count_values(unpack('v*', $buckets[$p])) as $did => $count) {
-                $counts[$offset + $did] += $count;
+        $base = 0;
+        foreach ($buckets as $bucket) {
+            if ($bucket !== '') {
+                foreach (array_count_values(unpack('v*', $bucket)) as $did => $cnt) {
+                    $counts[$base + $did] += $cnt;
+                }
             }
+            $base += $dateCount;
         }
-
         return $counts;
     }
 
     private function writeJson(
-        $outputPath, $counts, $paths,
-        $dates, $dateCount,
+        $outputPath, $counts, $pathPrefixes,
+        $datePrefixes, $pathCount, $dateCount,
     ) {
         $out = fopen($outputPath, 'wb');
         stream_set_write_buffer($out, 1_048_576);
 
-        $datePrefixes = [];
-        for ($d = 0; $d < $dateCount; $d++) {
-            $datePrefixes[$d] = '        "20' . $dates[$d] . '": ';
-        }
-
-        $pathCount = count($paths);
-        $escapedPaths = [];
-        for ($p = 0; $p < $pathCount; $p++) {
-            $escapedPaths[$p] = "\"\\/blog\\/" . str_replace('/', '\\/', $paths[$p]) . "\"";
-        }
-
-        fwrite($out, '{');
+        $buf = '{';
         $firstPath = true;
+        $base = 0;
 
         for ($p = 0; $p < $pathCount; $p++) {
-            $base = $p * $dateCount;
-            $dateEntries = [];
+            $dateBuf = '';
+            $sep = "\n";
 
             for ($d = 0; $d < $dateCount; $d++) {
-                $count = $counts[$base + $d];
-                if ($count === 0) continue;
-                $dateEntries[] = $datePrefixes[$d] . $count;
+                $n = $counts[$base + $d];
+                if ($n === 0) continue;
+                $dateBuf .= $sep . $datePrefixes[$d] . $n;
+                $sep = ",\n";
             }
 
-            if ($dateEntries === []) continue;
+            if ($dateBuf === '') {
+                $base += $dateCount;
+                continue;
+            }
 
-            fwrite(
-                $out,
-                ($firstPath ? '' : ',')
-                . "\n    " . $escapedPaths[$p] . ": {\n"
-                . implode(",\n", $dateEntries)
-                . "\n    }",
-            );
+            $buf .= ($firstPath ? '' : ',') . $pathPrefixes[$p] . $dateBuf . "\n    }";
             $firstPath = false;
+
+            if (strlen($buf) > 65536) {
+                fwrite($out, $buf);
+                $buf = '';
+            }
+
+            $base += $dateCount;
         }
 
-        fwrite($out, "\n}");
+        fwrite($out, $buf . "\n}");
         fclose($out);
     }
 }
